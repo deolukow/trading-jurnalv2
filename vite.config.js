@@ -36,5 +36,5 @@ export default defineConfig({
         ]
       }
     })],
-  base: '/trading-jurnal/',
+  base: '/trading-jurnalv2/',
 })
