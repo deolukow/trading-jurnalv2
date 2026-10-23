@@ -58,7 +58,19 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   LineChart,
+  FileSpreadsheet,
+  RefreshCw,
+  ExternalLink,
 } from "lucide-react";
+
+import {
+  scheduleDebouncedSync,
+  syncTwoWayWithGoogle,
+  uploadImageToDrive,
+  getStoredToken,
+  subscribeSyncStatus,
+  getSpreadsheetId,
+} from "./services/googleSyncService";
 
 // modular components
 import { Toast } from "./components/common/Toast";
@@ -165,18 +177,29 @@ function App() {
     String(new Date().getMonth()),
   );
   const [isDashboardSyncing, setIsDashboardSyncing] = useState(false);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState("idle");
 
-  // Load Google Identity Services OAuth script
+  // Subscribe to Google Sheets & Drive sync status
   useEffect(() => {
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    document.body.appendChild(script);
-    return () => {
-      document.body.removeChild(script);
-    };
+    const unsub = subscribeSyncStatus((status) => {
+      setCloudSyncStatus(status);
+      setIsDashboardSyncing(status === "syncing");
+    });
+    return unsub;
   }, []);
+
+  // Initial startup sync if Google account is connected
+  useEffect(() => {
+    if (getStoredToken()) {
+      syncTwoWayWithGoogle()
+        .then((res) => {
+          if (res?.success && activeProfile) {
+            refreshAllData(activeProfile.id, false);
+          }
+        })
+        .catch((err) => console.warn("Startup Google sync error:", err));
+    }
+  }, [activeProfile?.id]);
 
   // Splash Screen timer control
   useEffect(() => {
@@ -796,132 +819,33 @@ function App() {
   }, [activeProfile]);
 
   const handleDashboardBackup = async () => {
-    const token = localStorage.getItem("gdrive_sync_token");
+    const token = getStoredToken();
     if (!token) {
-      showToast("Silakan hubungkan Google Drive terlebih dahulu di menu Sinkronisasi Cloud.", "error");
+      showToast("Silakan hubungkan akun Google terlebih dahulu di menu Sinkronisasi Cloud.", "error");
+      setActiveView("sync");
       return;
     }
     setIsDashboardSyncing(true);
-    showToast("Sedang mencadangkan data...", "info");
+    showToast("Sedang menyinkronkan data dengan Google Sheets & Drive...", "info");
     try {
-      const backupData = await exportIndexedDB();
-      const scanRes = await fetch(
-        "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&fields=files(id,name)",
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      let fileId = null;
-      if (scanRes.ok) {
-        const data = await scanRes.json();
-        const backupFile = data.files.find(f => f.name === "trading_journal_backup.json");
-        fileId = backupFile?.id;
-      }
-      const fileMetadata = {
-        name: "trading_journal_backup.json",
-        parents: ["appDataFolder"]
-      };
-      const fileBlob = new Blob([JSON.stringify(backupData)], { type: "application/json" });
-      let uploadRes;
-      if (fileId) {
-        uploadRes = await fetch(
-          `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
-          {
-            method: "PATCH",
-            headers: {
-              Authorization: `Bearer ${token}`,
-              "Content-Type": "application/json"
-            },
-            body: fileBlob
-          }
-        );
-      } else {
-        const form = new FormData();
-        form.append("metadata", new Blob([JSON.stringify(fileMetadata)], { type: "application/json" }));
-        form.append("file", fileBlob);
-        uploadRes = await fetch(
-          "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
-          {
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}` },
-            body: form
-          }
-        );
-      }
-      if (uploadRes.ok) {
-        const now = new Date().toLocaleString("id-ID", {
-          day: "numeric",
-          month: "long",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit"
-        });
+      const res = await syncTwoWayWithGoogle();
+      if (res.success) {
+        showToast("Sinkronisasi 2 arah berhasil!", "success");
         if (activeProfile) {
-          localStorage.setItem(`gdrive_last_sync_${activeProfile.id}`, now);
+          refreshAllData(activeProfile.id, false);
         }
-        showToast("Berhasil mencadangkan data ke cloud!", "success");
       } else {
-        throw new Error();
+        showToast(res.error || "Gagal melakukan sinkronisasi.", "error");
       }
     } catch {
-      showToast("Gagal melakukan pencadangan data.", "error");
+      showToast("Gagal melakukan sinkronisasi dengan Google.", "error");
     } finally {
       setIsDashboardSyncing(false);
     }
   };
 
   const handleDashboardRestore = async () => {
-    const token = localStorage.getItem("gdrive_sync_token");
-    if (!token) {
-      showToast("Silakan hubungkan Google Drive terlebih dahulu di menu Sinkronisasi Cloud.", "error");
-      return;
-    }
-    const confirmRestore = window.confirm(
-      "PERHATIAN! Mengimpor data cadangan akan menghapus seluruh data lokal Anda saat ini pada perangkat ini.\n\nApakah Anda yakin ingin melanjutkan?"
-    );
-    if (!confirmRestore) return;
-    setIsDashboardSyncing(true);
-    showToast("Mengunduh data cadangan dari cloud...", "info");
-    try {
-      const scanRes = await fetch(
-        "https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&fields=files(id,name)",
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (!scanRes.ok) throw new Error();
-      const data = await scanRes.json();
-      const backupFile = data.files.find(f => f.name === "trading_journal_backup.json");
-      if (!backupFile) {
-        showToast("Tidak ditemukan file cadangan di Google Drive.", "error");
-        setIsDashboardSyncing(false);
-        return;
-      }
-      const downloadRes = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${backupFile.id}?alt=media`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (downloadRes.ok) {
-        const backupData = await downloadRes.json();
-        await importIndexedDB(backupData);
-        const now = new Date().toLocaleString("id-ID", {
-          day: "numeric",
-          month: "long",
-          year: "numeric",
-          hour: "2-digit",
-          minute: "2-digit"
-        });
-        if (activeProfile) {
-          localStorage.setItem(`gdrive_last_sync_${activeProfile.id}`, now);
-        }
-        showToast("Pemulihan data sukses! Aplikasi akan dimuat ulang...", "success");
-        setTimeout(() => {
-          window.location.reload();
-        }, 1500);
-      } else {
-        throw new Error();
-      }
-    } catch {
-      showToast("Gagal memulihkan data dari cloud.", "error");
-    } finally {
-      setIsDashboardSyncing(false);
-    }
+    await handleDashboardBackup();
   };
 
   const refreshAllData = useCallback(async (profileId, shouldBackup = false) => {
@@ -1157,11 +1081,33 @@ function App() {
         const newId = crypto.randomUUID();
         await addItem("trade_images", { id: newId, file: beforeFile });
         finalTradeData.screenshotBeforeId = newId;
+
+        // If Google Drive connected, upload in background and update URL
+        if (getStoredToken()) {
+          uploadImageToDrive(beforeFile, `before_${newId}.png`)
+            .then(async (uploaded) => {
+              finalTradeData.screenshotBeforeId = uploaded.directUrl;
+              await updateItem("trades", finalTradeData);
+              scheduleDebouncedSync(2000);
+            })
+            .catch((err) => console.warn("Drive image upload error:", err));
+        }
       }
       if (afterFile) {
         const newId = crypto.randomUUID();
         await addItem("trade_images", { id: newId, file: afterFile });
         finalTradeData.screenshotAfterId = newId;
+
+        // If Google Drive connected, upload in background and update URL
+        if (getStoredToken()) {
+          uploadImageToDrive(afterFile, `after_${newId}.png`)
+            .then(async (uploaded) => {
+              finalTradeData.screenshotAfterId = uploaded.directUrl;
+              await updateItem("trades", finalTradeData);
+              scheduleDebouncedSync(2000);
+            })
+            .catch((err) => console.warn("Drive image upload error:", err));
+        }
       }
 
       if (isEditing) {
@@ -1183,7 +1129,10 @@ function App() {
       );
       setEditingTrade(null);
       setIsTradeFormVisible(false);
-      refreshAllData(activeProfile.id, true);
+      refreshAllData(activeProfile.id, false);
+
+      // Trigger auto-sync to Google Sheets & Drive
+      scheduleDebouncedSync(3000);
     } catch (e) {
       console.error(e);
       showToast("Gagal menyimpan trade.", "error");
@@ -1200,7 +1149,8 @@ function App() {
         updatedAt: now,
       });
       showToast("Trade berhasil ditutup!", "success");
-      refreshAllData(activeProfile.id, true);
+      refreshAllData(activeProfile.id, false);
+      scheduleDebouncedSync(2000);
     } catch (e) {
       console.error(e);
       showToast("Gagal menutup trade.", "error");
@@ -1292,7 +1242,8 @@ function App() {
 
       await deleteItem(storeName, data.id);
       showToast(`${itemName} berhasil dihapus.`, "success");
-      refreshAllData(activeProfile.id, true);
+      refreshAllData(activeProfile.id, false);
+      scheduleDebouncedSync(2000);
     } catch (e) {
       console.error(`Error deleting ${type}:`, e);
       showToast(`Gagal menghapus item.`, "error");
@@ -2077,8 +2028,8 @@ function App() {
             }}
           />
           <SidebarLink
-            icon={<Cloud size={20} className="text-violet-500" />}
-            text="Sinkronisasi Cloud"
+            icon={<Cloud size={20} className={cloudSyncStatus === "synced" ? "text-emerald-500" : "text-violet-500"} />}
+            text="Google Sheets & Drive"
             active={activeView === "sync"}
             onClick={() => {
               setActiveView("sync");
@@ -2481,32 +2432,36 @@ function App() {
               {activeView === "dashboard" && (
                 <>
                   {/* Google Drive Upload Shortcut */}
+                  {/* Google Sheets & Drive Two-Way Sync Shortcut */}
                   <button
                     onClick={handleDashboardBackup}
                     disabled={isDashboardSyncing}
-                    className="p-3 bg-white dark:bg-gray-800 text-violet-500 hover:text-white hover:bg-violet-600 dark:hover:bg-violet-600 border border-gray-200 dark:border-gray-700 rounded-lg flex items-center justify-center transition-all cursor-pointer shadow-sm hover:shadow-[0_0_12px_rgba(139,92,246,0.35)] active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="Cadangkan Cepat ke Google Drive (Upload)"
+                    className={`p-3 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg flex items-center justify-center transition-all cursor-pointer shadow-sm active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed ${
+                      cloudSyncStatus === "synced"
+                        ? "text-emerald-500 hover:text-white hover:bg-emerald-600 dark:hover:bg-emerald-600 hover:shadow-[0_0_12px_rgba(16,185,129,0.35)]"
+                        : "text-indigo-500 hover:text-white hover:bg-indigo-600 dark:hover:bg-indigo-600 hover:shadow-[0_0_12px_rgba(99,102,241,0.35)]"
+                    }`}
+                    title={
+                      cloudSyncStatus === "synced"
+                        ? "Tersinkron dengan Google Sheets (Klik untuk sinkron ulang)"
+                        : "Sinkronkan dengan Google Sheets & Drive (Two-Way Sync)"
+                    }
                   >
-                    {isDashboardSyncing ? (
-                      <div className="w-[18px] h-[18px] border-2 border-violet-500 border-t-transparent rounded-full animate-spin"></div>
-                    ) : (
-                      <CloudUpload size={18} />
-                    )}
+                    <RefreshCw size={18} className={isDashboardSyncing ? "animate-spin text-amber-500" : ""} />
                   </button>
 
-                  {/* Google Drive Fetch/Restore Shortcut */}
-                  <button
-                    onClick={handleDashboardRestore}
-                    disabled={isDashboardSyncing}
-                    className="p-3 bg-white dark:bg-gray-800 text-blue-500 hover:text-white hover:bg-blue-600 dark:hover:bg-blue-600 border border-gray-200 dark:border-gray-700 rounded-lg flex items-center justify-center transition-all cursor-pointer shadow-sm hover:shadow-[0_0_12px_rgba(59,130,246,0.35)] active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="Unduh Cadangan dari Google Drive (Fetch)"
-                  >
-                    {isDashboardSyncing ? (
-                      <div className="w-[18px] h-[18px] border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
-                    ) : (
-                      <CloudDownload size={18} />
-                    )}
-                  </button>
+                  {/* Open Google Sheets Direct Shortcut */}
+                  {getSpreadsheetId() && (
+                    <a
+                      href={`https://docs.google.com/spreadsheets/d/${getSpreadsheetId()}/edit`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="p-3 bg-white dark:bg-gray-800 text-emerald-600 hover:text-white hover:bg-emerald-600 dark:hover:bg-emerald-600 border border-gray-200 dark:border-gray-700 rounded-lg flex items-center justify-center transition-all cursor-pointer shadow-sm hover:shadow-[0_0_12px_rgba(16,185,129,0.35)] active:scale-95"
+                      title="Buka Spreadsheet di Google Sheets"
+                    >
+                      <FileSpreadsheet size={18} />
+                    </a>
+                  )}
 
                   <button
                     onClick={() => setShowDashboardShareModal(true)}
